@@ -1,33 +1,44 @@
 /**
  * pi-rate-limit-guard
  *
- * Problem: when a provider returns 429/529 with no `retry-after` header (common
- * on Anthropic subscription/OAuth usage-cap errors), pi's own fail-fast safety
- * net (`retry.provider.maxRetryDelayMs`) has nothing to key off, so it keeps
- * retrying silently. The turn just sits on "Working..." with no indication of
- * why, for as long as the account stays capped — which can be hours.
+ * v0.1 targeted 429/529 responses via `after_provider_response`, tracking
+ * consecutive rate-limit/overload status codes. That covers a provider that
+ * fails FAST and REPEATEDLY with an error status.
  *
- * This extension does NOT change pi's core retry engine (that isn't exposed to
- * extensions). It observes every provider HTTP response via
- * `after_provider_response` — which fires once per attempt, including
- * retries — and:
+ * Reproduced empirically (see README "How this was diagnosed"): the actual
+ * "stuck on Working... indefinitely" failure is a DIFFERENT shape entirely —
+ * the provider accepts the request, returns a normal `200` with valid
+ * stream headers (so `after_provider_response` sees nothing wrong, and pi's
+ * own retry logic never engages because nothing failed), and then the
+ * stream simply never delivers another byte. No status code, no retry, no
+ * signal at all — just silence, forever. A status-code detector has
+ * structurally nothing to catch here.
  *
- *   1. Surfaces a live, visible footer status once consecutive rate-limit/
- *      overload responses cross a threshold, instead of a bare spinner.
- *   2. Notifies once when the threshold is first crossed, so it's visible
- *      even if you're not staring at the footer.
- *   3. After a configurable ceiling, either aborts the run with a clear
- *      message (default) or auto-switches to a fallback model, so you are
- *      never stuck silently — you get control back.
+ * v0.2 adds an idle/stall watchdog that doesn't care about status codes at
+ * all: it tracks wall-clock time since the LAST sign of forward progress
+ * during an active turn (a provider request going out, a response's headers
+ * coming back, or any streamed message content arriving). If that goes
+ * silent past a threshold while a turn is still active, it's a stall by
+ * definition — regardless of whether the provider ever sent an error — and
+ * we notify + abort (or fall back to another model) exactly like v0.1 did
+ * for the 429/529 case. The original status-code tracker is kept alongside
+ * it for the cases that DO fail fast and visibly with 429/529.
+ *
+ * This extension does NOT change pi's core retry engine (that isn't exposed
+ * to extensions). Both mechanisms here are observe-and-react, using only
+ * documented extension hooks (`after_provider_response`, `before_provider_request`,
+ * `turn_start`/`turn_end`, `message_start`/`message_update`,
+ * `tool_execution_*`) plus `ctx.abort()` / `pi.setModel()` as the escape hatch.
  *
  * Configuration (environment variables, all optional):
- *   PI_RATE_LIMIT_GUARD_DISABLE=1                disable entirely
- *   PI_RATE_LIMIT_GUARD_WARN_AFTER=2             consecutive 429/529s before showing a footer warning (default 2)
- *   PI_RATE_LIMIT_GUARD_ABORT_AFTER_MS=120000    wall-clock ms stuck retrying before we act (default 120000 = 2min)
- *   PI_RATE_LIMIT_GUARD_FALLBACK_MODEL=provider/model-id   if set, switch model instead of aborting once the ceiling is hit
+ *   PI_RATE_LIMIT_GUARD_DISABLE=1                 disable entirely
+ *   PI_RATE_LIMIT_GUARD_STALL_TIMEOUT_MS=90000     [idle watchdog] ms of silence during an active turn before acting (default 90000 = 90s)
+ *   PI_RATE_LIMIT_GUARD_WARN_AFTER=2               [status tracker] consecutive 429/529s before showing a footer warning (default 2)
+ *   PI_RATE_LIMIT_GUARD_ABORT_AFTER_MS=120000      [status tracker] wall-clock ms stuck in a visible 429/529 streak before we act (default 120000 = 2min)
+ *   PI_RATE_LIMIT_GUARD_FALLBACK_MODEL=provider/model-id   if set, switch model instead of aborting once either ceiling is hit
  *
  * Commands:
- *   /rate-limit-guard status   show current tracked state
+ *   /rate-limit-guard status   show current tracked state (both mechanisms)
  *   /rate-limit-guard reset    clear tracked state manually
  */
 
@@ -38,11 +49,21 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 // or 401 are not included — those are not transient and retrying won't help).
 const RATE_LIMIT_STATUSES = new Set([429, 529]);
 
-interface GuardState {
+const CHECK_INTERVAL_MS = 5_000;
+const STALL_WARN_RATIO = 0.5;
+
+interface StatusState {
   consecutiveHits: number;
   firstHitAt: number | undefined;
   lastStatus: number | undefined;
   lastHadRetryAfter: boolean;
+  warned: boolean;
+  acted: boolean;
+}
+
+interface StallState {
+  turnActive: boolean;
+  lastActivityAt: number | undefined;
   warned: boolean;
   acted: boolean;
 }
@@ -67,11 +88,13 @@ export default function (pi: ExtensionAPI) {
 
   const WARN_AFTER = envInt("PI_RATE_LIMIT_GUARD_WARN_AFTER", 2);
   const ABORT_AFTER_MS = envInt("PI_RATE_LIMIT_GUARD_ABORT_AFTER_MS", 120_000);
+  const STALL_TIMEOUT_MS = envInt("PI_RATE_LIMIT_GUARD_STALL_TIMEOUT_MS", 90_000);
   const FALLBACK_MODEL = process.env.PI_RATE_LIMIT_GUARD_FALLBACK_MODEL;
 
   const STATUS_KEY = "rate-limit-guard";
+  const STALL_STATUS_KEY = "rate-limit-guard-stall";
 
-  let state: GuardState = {
+  let statusState: StatusState = {
     consecutiveHits: 0,
     firstHitAt: undefined,
     lastStatus: undefined,
@@ -80,8 +103,20 @@ export default function (pi: ExtensionAPI) {
     acted: false,
   };
 
-  function resetState(ctx: ExtensionContext) {
-    state = {
+  let stallState: StallState = {
+    turnActive: false,
+    lastActivityAt: undefined,
+    warned: false,
+    acted: false,
+  };
+
+  // Retained so the periodic watchdog check (running outside any single
+  // event dispatch) can still call ctx.ui.*/ctx.abort(). These are
+  // session/agent-level operations, not tied to the lifetime of one event.
+  let lastCtx: ExtensionContext | undefined;
+
+  function resetStatusState(ctx: ExtensionContext) {
+    statusState = {
       consecutiveHits: 0,
       firstHitAt: undefined,
       lastStatus: undefined,
@@ -92,50 +127,83 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus(STATUS_KEY, undefined);
   }
 
-  // A clean (non-rate-limited) response ends the streak — the provider is
-  // healthy again, whatever we were tracking no longer applies.
-  function clearStreak(ctx: ExtensionContext) {
-    if (state.consecutiveHits > 0) resetState(ctx);
+  function clearStatusStreak(ctx: ExtensionContext) {
+    if (statusState.consecutiveHits > 0) resetStatusState(ctx);
   }
 
-  pi.on("after_provider_response", (event, ctx) => {
-    const status = event.status;
+  function markActivity(ctx: ExtensionContext) {
+    lastCtx = ctx;
+    stallState.lastActivityAt = Date.now();
+    if (stallState.warned || stallState.acted) {
+      stallState.warned = false;
+      stallState.acted = false;
+      ctx.ui.setStatus(STALL_STATUS_KEY, undefined);
+    }
+  }
 
+  function actOnFallbackOrAbort(ctx: ExtensionContext, reason: string) {
+    if (FALLBACK_MODEL) {
+      const [provider, ...rest] = FALLBACK_MODEL.split("/");
+      const modelId = rest.join("/");
+      const model = provider && modelId ? ctx.modelRegistry.find(provider, modelId) : undefined;
+      if (model) {
+        ctx.ui.notify(
+          `${reason} — switching to fallback model ${FALLBACK_MODEL}. ` +
+            `Note: on a shared subscription/usage-cap plan this may not help if the cap applies account-wide.`,
+          "warning",
+        );
+        void pi.setModel(model).then((ok) => {
+          if (!ok) {
+            ctx.ui.notify(`Could not switch to ${FALLBACK_MODEL} (no API key for that model).`, "error");
+          }
+        });
+        return;
+      }
+      ctx.ui.notify(
+        `PI_RATE_LIMIT_GUARD_FALLBACK_MODEL="${FALLBACK_MODEL}" did not resolve to a known model; aborting instead.`,
+        "error",
+      );
+    }
+    ctx.ui.notify(reason, "error");
+    ctx.abort();
+  }
+
+  // ── Mechanism 1: status-code tracker (429/529, fails fast + visibly) ──
+
+  pi.on("after_provider_response", (event, ctx) => {
+    markActivity(ctx);
+
+    const status = event.status;
     if (!RATE_LIMIT_STATUSES.has(status)) {
-      clearStreak(ctx);
+      clearStatusStreak(ctx);
       return;
     }
 
-    const retryAfterHeader =
-      event.headers?.["retry-after"] ?? event.headers?.["Retry-After"];
+    const retryAfterHeader = event.headers?.["retry-after"] ?? event.headers?.["Retry-After"];
     const hasRetryAfter = !!retryAfterHeader;
 
-    state.consecutiveHits += 1;
-    state.lastStatus = status;
-    state.lastHadRetryAfter = hasRetryAfter;
-    if (state.firstHitAt === undefined) state.firstHitAt = Date.now();
+    statusState.consecutiveHits += 1;
+    statusState.lastStatus = status;
+    statusState.lastHadRetryAfter = hasRetryAfter;
+    if (statusState.firstHitAt === undefined) statusState.firstHitAt = Date.now();
 
-    const elapsed = Date.now() - state.firstHitAt;
+    const elapsed = Date.now() - statusState.firstHitAt;
     const label = status === 429 ? "rate limited" : "overloaded";
 
-    // Below the warn threshold: stay quiet, this may just be one transient
-    // hiccup that pi's own retry resolves on the next attempt.
-    if (state.consecutiveHits < WARN_AFTER) return;
+    if (statusState.consecutiveHits < WARN_AFTER) return;
 
     const theme = ctx.ui.theme;
-    const retryNote = hasRetryAfter
-      ? `retry-after ${retryAfterHeader}s`
-      : "no retry-after from provider";
+    const retryNote = hasRetryAfter ? `retry-after ${retryAfterHeader}s` : "no retry-after from provider";
     ctx.ui.setStatus(
       STATUS_KEY,
       theme.fg(
         "warning",
-        `⚠ ${label} (${status}) — attempt ${state.consecutiveHits}, ${fmtElapsed(elapsed)} elapsed, ${retryNote}`,
+        `⚠ ${label} (${status}) — attempt ${statusState.consecutiveHits}, ${fmtElapsed(elapsed)} elapsed, ${retryNote}`,
       ),
     );
 
-    if (!state.warned) {
-      state.warned = true;
+    if (!statusState.warned) {
+      statusState.warned = true;
       ctx.ui.notify(
         `Provider ${label} (HTTP ${status}). Pi is retrying automatically` +
           (hasRetryAfter
@@ -145,75 +213,132 @@ export default function (pi: ExtensionAPI) {
       );
     }
 
-    // Without a retry-after header, a provider 429/529 gives pi's own
-    // fail-fast cap (retry.provider.maxRetryDelayMs) nothing to key off, so it
-    // can retry silently until the underlying quota resets — potentially
-    // hours for a subscription usage cap. Once we've been stuck past the
-    // ceiling with no sign of a bounded wait, act instead of leaving the user
-    // staring at a silent "Working...".
-    if (!state.acted && !hasRetryAfter && elapsed >= ABORT_AFTER_MS) {
-      state.acted = true;
-
-      if (FALLBACK_MODEL) {
-        const [provider, ...rest] = FALLBACK_MODEL.split("/");
-        const modelId = rest.join("/");
-        const model = provider && modelId ? ctx.modelRegistry.find(provider, modelId) : undefined;
-        if (model) {
-          ctx.ui.notify(
-            `Still ${label} after ${fmtElapsed(elapsed)} with no retry-after — switching to fallback model ${FALLBACK_MODEL}. ` +
-              `Note: on a shared subscription/usage-cap plan this may not help if the cap applies account-wide.`,
-            "warning",
-          );
-          void pi.setModel(model).then((ok) => {
-            if (!ok) {
-              ctx.ui.notify(`Could not switch to ${FALLBACK_MODEL} (no API key for that model).`, "error");
-            }
-          });
-        } else {
-          ctx.ui.notify(
-            `PI_RATE_LIMIT_GUARD_FALLBACK_MODEL="${FALLBACK_MODEL}" did not resolve to a known model; aborting instead.`,
-            "error",
-          );
-          ctx.abort();
-        }
-      } else {
-        ctx.ui.notify(
-          `Still ${label} after ${fmtElapsed(elapsed)} with no retry-after from the provider — aborting so you're not stuck on a silent "Working...". ` +
-            `This is very likely an account-level usage cap; check your provider dashboard, wait for it to reset, or switch models/providers. ` +
-            `(Set PI_RATE_LIMIT_GUARD_FALLBACK_MODEL to auto-switch instead of aborting, or PI_RATE_LIMIT_GUARD_ABORT_AFTER_MS to change this ceiling.)`,
-          "error",
-        );
-        ctx.abort();
-      }
+    if (!statusState.acted && !hasRetryAfter && elapsed >= ABORT_AFTER_MS) {
+      statusState.acted = true;
+      actOnFallbackOrAbort(
+        ctx,
+        `Still ${label} after ${fmtElapsed(elapsed)} with no retry-after — you're not stuck on a silent "Working...".`,
+      );
     }
   });
 
-  // A successful turn completing is also a good signal to clear any stale
-  // warning left in the footer from an earlier, now-resolved streak.
-  pi.on("turn_end", async (_event, ctx) => {
-    clearStreak(ctx);
+  // ── Mechanism 2: idle/stall watchdog (catches wedged 200/streaming) ──
+  //
+  // Tracks the last sign of forward progress during an active turn. If a
+  // turn is active and nothing has happened for STALL_TIMEOUT_MS — no
+  // provider request going out, no response headers coming back, no
+  // streamed content, no tool activity — that is a stall by definition,
+  // independent of whether the provider ever returned an error status.
+
+  pi.on("turn_start", async (_event, ctx) => {
+    stallState.turnActive = true;
+    stallState.warned = false;
+    stallState.acted = false;
+    markActivity(ctx);
   });
+
+  pi.on("before_provider_request", (_event, ctx) => {
+    markActivity(ctx);
+  });
+
+  pi.on("message_start", async (_event, ctx) => {
+    markActivity(ctx);
+  });
+
+  pi.on("message_update", async (_event, ctx) => {
+    markActivity(ctx);
+  });
+
+  pi.on("tool_execution_start", async (_event, ctx) => {
+    markActivity(ctx);
+  });
+
+  pi.on("tool_execution_update", async (_event, ctx) => {
+    markActivity(ctx);
+  });
+
+  pi.on("tool_execution_end", async (_event, ctx) => {
+    markActivity(ctx);
+  });
+
+  function endTurn(ctx: ExtensionContext) {
+    stallState.turnActive = false;
+    stallState.warned = false;
+    stallState.acted = false;
+    ctx.ui.setStatus(STALL_STATUS_KEY, undefined);
+    clearStatusStreak(ctx);
+  }
+
+  pi.on("turn_end", async (_event, ctx) => {
+    endTurn(ctx);
+  });
+
+  pi.on("agent_end", async (_event, ctx) => {
+    endTurn(ctx);
+  });
+
+  const watchdog = setInterval(() => {
+    if (!stallState.turnActive || !lastCtx || stallState.lastActivityAt === undefined) return;
+    if (stallState.acted) return;
+
+    const ctx = lastCtx;
+    const elapsed = Date.now() - stallState.lastActivityAt;
+
+    if (elapsed >= STALL_TIMEOUT_MS) {
+      stallState.acted = true;
+      const theme = ctx.ui.theme;
+      ctx.ui.setStatus(
+        STALL_STATUS_KEY,
+        theme.fg("error", `⚠ stalled — no activity for ${fmtElapsed(elapsed)}, aborting`),
+      );
+      actOnFallbackOrAbort(
+        ctx,
+        `No provider activity for ${fmtElapsed(elapsed)} during an active turn (no error, no data — a wedged connection/stream). Aborting so you're not stuck on a silent "Working...".`,
+      );
+      return;
+    }
+
+    if (!stallState.warned && elapsed >= STALL_TIMEOUT_MS * STALL_WARN_RATIO) {
+      stallState.warned = true;
+      const theme = ctx.ui.theme;
+      ctx.ui.setStatus(
+        STALL_STATUS_KEY,
+        theme.fg("warning", `⚠ no provider activity for ${fmtElapsed(elapsed)} — watching for a stall`),
+      );
+    }
+  }, CHECK_INTERVAL_MS);
+  // Keep the process from staying alive just because of this timer.
+  (watchdog as unknown as { unref?: () => void }).unref?.();
 
   pi.registerCommand("rate-limit-guard", {
     description: "Show or reset pi-rate-limit-guard's tracked state",
     handler: async (args, ctx) => {
       const sub = (args || "").trim();
       if (sub === "reset") {
-        resetState(ctx);
+        resetStatusState(ctx);
+        stallState = { turnActive: stallState.turnActive, lastActivityAt: Date.now(), warned: false, acted: false };
+        ctx.ui.setStatus(STALL_STATUS_KEY, undefined);
         ctx.ui.notify("rate-limit-guard: state reset", "info");
         return;
       }
-      if (state.consecutiveHits === 0) {
-        ctx.ui.notify("rate-limit-guard: no active rate-limit streak", "info");
-        return;
+
+      const lines: string[] = [];
+      if (statusState.consecutiveHits > 0) {
+        const elapsed = statusState.firstHitAt ? Date.now() - statusState.firstHitAt : 0;
+        lines.push(
+          `status tracker: ${statusState.consecutiveHits} consecutive ${statusState.lastStatus} responses, ` +
+            `${fmtElapsed(elapsed)} elapsed, retry-after=${statusState.lastHadRetryAfter}, acted=${statusState.acted}`,
+        );
+      } else {
+        lines.push("status tracker: no active 429/529 streak");
       }
-      const elapsed = state.firstHitAt ? Date.now() - state.firstHitAt : 0;
-      ctx.ui.notify(
-        `rate-limit-guard: ${state.consecutiveHits} consecutive ${state.lastStatus} responses, ` +
-          `${fmtElapsed(elapsed)} elapsed, retry-after=${state.lastHadRetryAfter}, acted=${state.acted}. ` +
-          `Run "/rate-limit-guard reset" to clear.`,
-        "info",
-      );
+      if (stallState.turnActive && stallState.lastActivityAt !== undefined) {
+        const elapsed = Date.now() - stallState.lastActivityAt;
+        lines.push(`idle watchdog: turn active, ${fmtElapsed(elapsed)} since last activity, acted=${stallState.acted}`);
+      } else {
+        lines.push("idle watchdog: no active turn");
+      }
+      ctx.ui.notify(`rate-limit-guard: ${lines.join(" | ")}. Run "/rate-limit-guard reset" to clear.`, "info");
     },
   });
 }
