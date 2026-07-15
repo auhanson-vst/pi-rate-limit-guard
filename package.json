@@ -1,0 +1,29 @@
+{
+  "name": "pi-rate-limit-guard",
+  "version": "0.1.0",
+  "description": "Pi extension: surfaces provider rate-limit (429/529) stalls instead of a silent infinite \"Working...\" spinner, with an escape hatch to abort or fall back to another model.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "rate-limit",
+    "reliability"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/auhanson-vst/pi-rate-limit-guard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/auhanson-vst/pi-rate-limit-guard/issues"
+  },
+  "homepage": "https://github.com/auhanson-vst/pi-rate-limit-guard#readme",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
