@@ -30,19 +30,44 @@
  * `turn_start`/`turn_end`, `message_start`/`message_update`,
  * `tool_execution_*`) plus `ctx.abort()` / `pi.setModel()` as the escape hatch.
  *
- * Configuration (environment variables, all optional):
+ * Configuration — pi settings.json (preferred) or environment variables.
+ *
+ * settings.json (global `~/.pi/agent/settings.json` or project
+ * `.pi/settings.json`; project overrides global, same precedence pi itself
+ * uses for its own settings), under a `rateLimitGuard` key:
+ *
+ *   {
+ *     "rateLimitGuard": {
+ *       "stallTimeoutMs": 180000,     // [idle watchdog] ms of silence during an active turn before acting (default 180000 = 180s)
+ *       "warnAfter": 2,               // [status tracker] consecutive 429/529s before showing a footer warning (default 2)
+ *       "abortAfterMs": 120000,       // [status tracker] wall-clock ms stuck in a visible 429/529 streak before acting (default 120000 = 2min)
+ *       "fallbackModel": "provider/model-id"  // if set, switch model instead of aborting once either ceiling is hit
+ *     }
+ *   }
+ *
+ * pi has no first-class extension-settings API, so this reads settings.json
+ * directly off disk — the same convention `packages`/`compaction`/`retry`
+ * already use as arbitrary top-level keys. Settings are (re)loaded on every
+ * `session_start`, so editing settings.json takes effect on `/reload` or a
+ * new session, without needing to touch code.
+ *
+ * Environment variables override settings.json (useful for one-off/CI runs):
  *   PI_RATE_LIMIT_GUARD_DISABLE=1                 disable entirely
- *   PI_RATE_LIMIT_GUARD_STALL_TIMEOUT_MS=90000     [idle watchdog] ms of silence during an active turn before acting (default 90000 = 90s)
- *   PI_RATE_LIMIT_GUARD_WARN_AFTER=2               [status tracker] consecutive 429/529s before showing a footer warning (default 2)
- *   PI_RATE_LIMIT_GUARD_ABORT_AFTER_MS=120000      [status tracker] wall-clock ms stuck in a visible 429/529 streak before we act (default 120000 = 2min)
- *   PI_RATE_LIMIT_GUARD_FALLBACK_MODEL=provider/model-id   if set, switch model instead of aborting once either ceiling is hit
+ *   PI_RATE_LIMIT_GUARD_STALL_TIMEOUT_MS=180000
+ *   PI_RATE_LIMIT_GUARD_WARN_AFTER=2
+ *   PI_RATE_LIMIT_GUARD_ABORT_AFTER_MS=120000
+ *   PI_RATE_LIMIT_GUARD_FALLBACK_MODEL=provider/model-id
  *
  * Commands:
  *   /rate-limit-guard status   show current tracked state (both mechanisms)
  *   /rate-limit-guard reset    clear tracked state manually
+ *   /rate-limit-guard reload   re-read settings.json without restarting pi
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 // Status codes that indicate the provider is asking us to slow down / is
 // overloaded, as opposed to a real request error (4xx client errors like 400
@@ -68,11 +93,79 @@ interface StallState {
   acted: boolean;
 }
 
-function envInt(name: string, fallback: number): number {
+interface RateLimitGuardSettings {
+  stallTimeoutMs?: number;
+  warnAfter?: number;
+  abortAfterMs?: number;
+  fallbackModel?: string;
+}
+
+interface ResolvedConfig {
+  warnAfter: number;
+  abortAfterMs: number;
+  stallTimeoutMs: number;
+  fallbackModel: string | undefined;
+}
+
+const DEFAULTS = {
+  warnAfter: 2,
+  abortAfterMs: 120_000,
+  stallTimeoutMs: 180_000,
+};
+
+function envInt(name: string, fallback: number | undefined): number | undefined {
   const raw = process.env[name];
   if (!raw) return fallback;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function readRateLimitGuardSettings(path: string): RateLimitGuardSettings | undefined {
+  if (!existsSync(path)) return undefined;
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf-8"));
+    const section = raw && typeof raw === "object" ? raw.rateLimitGuard : undefined;
+    return section && typeof section === "object" ? (section as RateLimitGuardSettings) : undefined;
+  } catch {
+    // Malformed/unreadable settings.json is not this extension's problem to
+    // surface — fall through to env vars/defaults silently.
+    return undefined;
+  }
+}
+
+/**
+ * Precedence, highest first: explicit env var > project `.pi/settings.json`
+ * > global `~/.pi/agent/settings.json` > built-in default. Mirrors pi's own
+ * project-overrides-global merge behavior, scoped to our `rateLimitGuard` key.
+ */
+function resolveConfig(cwd: string | undefined): ResolvedConfig {
+  const globalSettings = readRateLimitGuardSettings(join(getAgentDir(), "settings.json"));
+  const projectSettings = cwd
+    ? readRateLimitGuardSettings(join(cwd, CONFIG_DIR_NAME, "settings.json"))
+    : undefined;
+
+  const warnAfter =
+    envInt("PI_RATE_LIMIT_GUARD_WARN_AFTER", undefined) ??
+    projectSettings?.warnAfter ??
+    globalSettings?.warnAfter ??
+    DEFAULTS.warnAfter;
+  const abortAfterMs =
+    envInt("PI_RATE_LIMIT_GUARD_ABORT_AFTER_MS", undefined) ??
+    projectSettings?.abortAfterMs ??
+    globalSettings?.abortAfterMs ??
+    DEFAULTS.abortAfterMs;
+  const stallTimeoutMs =
+    envInt("PI_RATE_LIMIT_GUARD_STALL_TIMEOUT_MS", undefined) ??
+    projectSettings?.stallTimeoutMs ??
+    globalSettings?.stallTimeoutMs ??
+    DEFAULTS.stallTimeoutMs;
+  const fallbackModel =
+    process.env.PI_RATE_LIMIT_GUARD_FALLBACK_MODEL ||
+    projectSettings?.fallbackModel ||
+    globalSettings?.fallbackModel ||
+    undefined;
+
+  return { warnAfter, abortAfterMs, stallTimeoutMs, fallbackModel };
 }
 
 function fmtElapsed(ms: number): string {
@@ -86,10 +179,11 @@ function fmtElapsed(ms: number): string {
 export default function (pi: ExtensionAPI) {
   if (process.env.PI_RATE_LIMIT_GUARD_DISABLE === "1") return;
 
-  const WARN_AFTER = envInt("PI_RATE_LIMIT_GUARD_WARN_AFTER", 2);
-  const ABORT_AFTER_MS = envInt("PI_RATE_LIMIT_GUARD_ABORT_AFTER_MS", 120_000);
-  const STALL_TIMEOUT_MS = envInt("PI_RATE_LIMIT_GUARD_STALL_TIMEOUT_MS", 90_000);
-  const FALLBACK_MODEL = process.env.PI_RATE_LIMIT_GUARD_FALLBACK_MODEL;
+  // Resolved eagerly (env vars + whatever settings.json is readable at
+  // load time) so the watchdog has sane values even before session_start
+  // fires; refreshed with ctx.cwd on session_start to pick up project-local
+  // .pi/settings.json too.
+  let config: ResolvedConfig = resolveConfig(undefined);
 
   const STATUS_KEY = "rate-limit-guard";
   const STALL_STATUS_KEY = "rate-limit-guard-stall";
@@ -142,31 +236,36 @@ export default function (pi: ExtensionAPI) {
   }
 
   function actOnFallbackOrAbort(ctx: ExtensionContext, reason: string) {
-    if (FALLBACK_MODEL) {
-      const [provider, ...rest] = FALLBACK_MODEL.split("/");
+    const fallbackModel = config.fallbackModel;
+    if (fallbackModel) {
+      const [provider, ...rest] = fallbackModel.split("/");
       const modelId = rest.join("/");
       const model = provider && modelId ? ctx.modelRegistry.find(provider, modelId) : undefined;
       if (model) {
         ctx.ui.notify(
-          `${reason} — switching to fallback model ${FALLBACK_MODEL}. ` +
+          `${reason} — switching to fallback model ${fallbackModel}. ` +
             `Note: on a shared subscription/usage-cap plan this may not help if the cap applies account-wide.`,
           "warning",
         );
         void pi.setModel(model).then((ok) => {
           if (!ok) {
-            ctx.ui.notify(`Could not switch to ${FALLBACK_MODEL} (no API key for that model).`, "error");
+            ctx.ui.notify(`Could not switch to ${fallbackModel} (no API key for that model).`, "error");
           }
         });
         return;
       }
       ctx.ui.notify(
-        `PI_RATE_LIMIT_GUARD_FALLBACK_MODEL="${FALLBACK_MODEL}" did not resolve to a known model; aborting instead.`,
+        `rateLimitGuard.fallbackModel/PI_RATE_LIMIT_GUARD_FALLBACK_MODEL="${fallbackModel}" did not resolve to a known model; aborting instead.`,
         "error",
       );
     }
     ctx.ui.notify(reason, "error");
     ctx.abort();
   }
+
+  pi.on("session_start", async (_event, ctx) => {
+    config = resolveConfig(ctx.cwd);
+  });
 
   // ── Mechanism 1: status-code tracker (429/529, fails fast + visibly) ──
 
@@ -190,7 +289,7 @@ export default function (pi: ExtensionAPI) {
     const elapsed = Date.now() - statusState.firstHitAt;
     const label = status === 429 ? "rate limited" : "overloaded";
 
-    if (statusState.consecutiveHits < WARN_AFTER) return;
+    if (statusState.consecutiveHits < config.warnAfter) return;
 
     const theme = ctx.ui.theme;
     const retryNote = hasRetryAfter ? `retry-after ${retryAfterHeader}s` : "no retry-after from provider";
@@ -213,7 +312,7 @@ export default function (pi: ExtensionAPI) {
       );
     }
 
-    if (!statusState.acted && !hasRetryAfter && elapsed >= ABORT_AFTER_MS) {
+    if (!statusState.acted && !hasRetryAfter && elapsed >= config.abortAfterMs) {
       statusState.acted = true;
       actOnFallbackOrAbort(
         ctx,
@@ -225,7 +324,7 @@ export default function (pi: ExtensionAPI) {
   // ── Mechanism 2: idle/stall watchdog (catches wedged 200/streaming) ──
   //
   // Tracks the last sign of forward progress during an active turn. If a
-  // turn is active and nothing has happened for STALL_TIMEOUT_MS — no
+  // turn is active and nothing has happened for config.stallTimeoutMs — no
   // provider request going out, no response headers coming back, no
   // streamed content, no tool activity — that is a stall by definition,
   // independent of whether the provider ever returned an error status.
@@ -284,7 +383,7 @@ export default function (pi: ExtensionAPI) {
     const ctx = lastCtx;
     const elapsed = Date.now() - stallState.lastActivityAt;
 
-    if (elapsed >= STALL_TIMEOUT_MS) {
+    if (elapsed >= config.stallTimeoutMs) {
       stallState.acted = true;
       const theme = ctx.ui.theme;
       ctx.ui.setStatus(
@@ -298,7 +397,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    if (!stallState.warned && elapsed >= STALL_TIMEOUT_MS * STALL_WARN_RATIO) {
+    if (!stallState.warned && elapsed >= config.stallTimeoutMs * STALL_WARN_RATIO) {
       stallState.warned = true;
       const theme = ctx.ui.theme;
       ctx.ui.setStatus(
@@ -311,9 +410,10 @@ export default function (pi: ExtensionAPI) {
   (watchdog as unknown as { unref?: () => void }).unref?.();
 
   pi.registerCommand("rate-limit-guard", {
-    description: "Show or reset pi-rate-limit-guard's tracked state",
+    description: "Show/reset pi-rate-limit-guard's tracked state, or reload its settings.json config",
     handler: async (args, ctx) => {
       const sub = (args || "").trim();
+
       if (sub === "reset") {
         resetStatusState(ctx);
         stallState = { turnActive: stallState.turnActive, lastActivityAt: Date.now(), warned: false, acted: false };
@@ -322,7 +422,22 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      if (sub === "reload") {
+        config = resolveConfig(ctx.cwd);
+        ctx.ui.notify(
+          `rate-limit-guard: settings reloaded — stallTimeoutMs=${config.stallTimeoutMs}, ` +
+            `warnAfter=${config.warnAfter}, abortAfterMs=${config.abortAfterMs}, ` +
+            `fallbackModel=${config.fallbackModel ?? "(none, aborts instead)"}`,
+          "info",
+        );
+        return;
+      }
+
       const lines: string[] = [];
+      lines.push(
+        `config: stallTimeoutMs=${config.stallTimeoutMs}, warnAfter=${config.warnAfter}, ` +
+          `abortAfterMs=${config.abortAfterMs}, fallbackModel=${config.fallbackModel ?? "(none, aborts instead)"}`,
+      );
       if (statusState.consecutiveHits > 0) {
         const elapsed = statusState.firstHitAt ? Date.now() - statusState.firstHitAt : 0;
         lines.push(
@@ -338,7 +453,10 @@ export default function (pi: ExtensionAPI) {
       } else {
         lines.push("idle watchdog: no active turn");
       }
-      ctx.ui.notify(`rate-limit-guard: ${lines.join(" | ")}. Run "/rate-limit-guard reset" to clear.`, "info");
+      ctx.ui.notify(
+        `rate-limit-guard: ${lines.join(" | ")}. "/rate-limit-guard reset" clears state, "/rate-limit-guard reload" re-reads settings.json.`,
+        "info",
+      );
     },
   });
 }
