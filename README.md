@@ -147,6 +147,28 @@ waiting for the cap to reset, or switching to a pay-per-token API key, are
 the reliable fixes; this extension mainly restores visibility and gives you
 back control instead of a silent hang.
 
+### Configuring it from inside pi
+
+pi's built-in `/settings` and `pi config` only cover pi's own fixed setting
+schema and package resource toggles — there's no extension API to add
+entries there, so a package's own arbitrary `settings.json` key (like
+`rateLimitGuard`) is invisible to both. Two ways to see/change it without
+leaving pi or hand-editing JSON:
+
+- **`rate_limit_guard_configure`** — an LLM-callable tool (via
+  `pi.registerTool()`), so you can just ask the agent to check or change
+  settings in conversation, e.g. *"set the rate-limit-guard stall timeout to
+  5 minutes"*. `action: "get"` returns the live resolved config;
+  `action: "set"` with one or more fields writes to `settings.json` (global
+  by default, or `scope: "project"` for `.pi/settings.json`) and applies
+  immediately — no `/reload` needed. Pass `fallbackModel: ""` to clear it.
+  Refuses to touch a malformed/non-object settings.json rather than
+  clobbering it, and preserves every other key untouched (verified: a
+  `someOtherKey` sibling and pre-existing `rateLimitGuard` fields both
+  survive a partial `set` unchanged).
+- **`/rate-limit-guard status`** — human-typed slash command, read-only,
+  shown below.
+
 ## Commands
 
 - `/rate-limit-guard status` — show current config, tracked state for both
@@ -154,6 +176,11 @@ back control instead of a silent hang.
 - `/rate-limit-guard reset` — manually clear tracked state, including the
   auto-continue counter.
 - `/rate-limit-guard reload` — re-read settings.json without restarting pi.
+
+## Tools
+
+- `rate_limit_guard_configure` — LLM-callable; get or set the config (see
+  "Configuring it from inside pi" above).
 
 ## How it fits with pi's own retry settings
 

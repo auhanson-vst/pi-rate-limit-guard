@@ -82,8 +82,10 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 // Status codes that indicate the provider is asking us to slow down / is
 // overloaded, as opposed to a real request error (4xx client errors like 400
@@ -215,6 +217,45 @@ function resolveConfig(cwd: string | undefined): ResolvedConfig {
     DEFAULTS.continueMessage;
 
   return { warnAfter, abortAfterMs, stallTimeoutMs, fallbackModel, autoContinue, maxAutoContinues, continueMessage };
+}
+
+/**
+ * Merge `updates` into the `rateLimitGuard` section of the settings.json at
+ * `path`, preserving every other top-level key untouched. A field set to
+ * `undefined` in `updates` deletes that key (used to clear `fallbackModel`).
+ * Throws (surfaced to the LLM as a tool error per pi's convention) rather
+ * than silently clobbering a malformed or non-object settings.json.
+ */
+function writeRateLimitGuardSettings(path: string, updates: RateLimitGuardSettings): void {
+  let root: Record<string, unknown> = {};
+
+  if (existsSync(path)) {
+    const raw = readFileSync(path, "utf-8");
+    try {
+      root = raw.trim().length > 0 ? JSON.parse(raw) : {};
+    } catch (err) {
+      throw new Error(`${path} contains invalid JSON — refusing to overwrite it: ${(err as Error).message}`);
+    }
+    if (root === null || typeof root !== "object" || Array.isArray(root)) {
+      throw new Error(`${path} does not contain a JSON object at the top level — refusing to overwrite it.`);
+    }
+  }
+
+  const existingSection =
+    root.rateLimitGuard && typeof root.rateLimitGuard === "object" && !Array.isArray(root.rateLimitGuard)
+      ? (root.rateLimitGuard as RateLimitGuardSettings)
+      : {};
+
+  const merged: Record<string, unknown> = { ...existingSection };
+  for (const [key, value] of Object.entries(updates)) {
+    if (value === undefined) delete merged[key];
+    else merged[key] = value;
+  }
+  root.rateLimitGuard = merged;
+
+  const dir = dirname(path);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(path, `${JSON.stringify(root, null, 2)}\n`, "utf-8");
 }
 
 function fmtElapsed(ms: number): string {
@@ -507,6 +548,83 @@ export default function (pi: ExtensionAPI) {
   }, CHECK_INTERVAL_MS);
   // Keep the process from staying alive just because of this timer.
   (watchdog as unknown as { unref?: () => void }).unref?.();
+
+  // LLM-callable tool — the /rate-limit-guard command above is human-typed
+  // only; pi.registerTool() is what makes something callable by the agent
+  // (via tool-calling) rather than requiring a human to type a slash command
+  // or hand-edit settings.json.
+  pi.registerTool({
+    name: "rate_limit_guard_configure",
+    label: "Rate Limit Guard Config",
+    description:
+      "Get or set pi-rate-limit-guard's configuration: stallTimeoutMs, warnAfter, abortAfterMs, fallbackModel, " +
+      "autoContinue, maxAutoContinues, continueMessage. `action: \"set\"` writes to settings.json under the " +
+      "rateLimitGuard key (global ~/.pi/agent/settings.json by default, or project .pi/settings.json with " +
+      'scope: "project") and applies immediately — no /reload needed. Pass fallbackModel: "" to clear it.',
+    promptSnippet: "rate_limit_guard_configure — get/set pi-rate-limit-guard settings (stall timeout, abort/retry behavior, auto-continue)",
+    promptGuidelines: [
+      'Use rate_limit_guard_configure with action: "get" to show the current rate-limit-guard config, or action: "set" with one or more fields to change it.',
+    ],
+    parameters: Type.Object({
+      action: StringEnum(["get", "set"] as const),
+      scope: Type.Optional(StringEnum(["global", "project"] as const)),
+      stallTimeoutMs: Type.Optional(Type.Number({ description: "Idle watchdog: ms of silence during an active turn before acting" })),
+      warnAfter: Type.Optional(Type.Number({ description: "Status tracker: consecutive 429/529s before showing a footer warning" })),
+      abortAfterMs: Type.Optional(Type.Number({ description: "Status tracker: ms stuck in a visible 429/529 streak before acting" })),
+      fallbackModel: Type.Optional(
+        Type.String({ description: 'provider/model-id to switch to instead of just retrying; pass "" to clear' }),
+      ),
+      autoContinue: Type.Optional(Type.Boolean({ description: 'Send a "continue" message after aborting' })),
+      maxAutoContinues: Type.Optional(
+        Type.Number({ description: "Stop auto-continuing after this many consecutive aborts with no clean run in between" }),
+      ),
+      continueMessage: Type.Optional(Type.String({ description: "The message sent to resume" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (params.action === "get") {
+        return {
+          content: [{ type: "text", text: JSON.stringify(config, null, 2) }],
+          details: config,
+        };
+      }
+
+      const updates: RateLimitGuardSettings = {};
+      if (params.stallTimeoutMs !== undefined) updates.stallTimeoutMs = params.stallTimeoutMs;
+      if (params.warnAfter !== undefined) updates.warnAfter = params.warnAfter;
+      if (params.abortAfterMs !== undefined) updates.abortAfterMs = params.abortAfterMs;
+      if (params.fallbackModel !== undefined) {
+        updates.fallbackModel = params.fallbackModel === "" ? undefined : params.fallbackModel;
+      }
+      if (params.autoContinue !== undefined) updates.autoContinue = params.autoContinue;
+      if (params.maxAutoContinues !== undefined) updates.maxAutoContinues = params.maxAutoContinues;
+      if (params.continueMessage !== undefined) updates.continueMessage = params.continueMessage;
+
+      if (Object.keys(updates).length === 0) {
+        throw new Error(
+          "No fields provided to set. Pass at least one of stallTimeoutMs/warnAfter/abortAfterMs/fallbackModel/autoContinue/maxAutoContinues/continueMessage, or use action: \"get\".",
+        );
+      }
+
+      const scope = params.scope ?? "global";
+      const targetPath =
+        scope === "project" && ctx.cwd
+          ? join(ctx.cwd, CONFIG_DIR_NAME, "settings.json")
+          : join(getAgentDir(), "settings.json");
+
+      writeRateLimitGuardSettings(targetPath, updates);
+      config = resolveConfig(ctx.cwd);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Updated ${targetPath} (rateLimitGuard). New effective config:\n${JSON.stringify(config, null, 2)}`,
+          },
+        ],
+        details: config,
+      };
+    },
+  });
 
   pi.registerCommand("rate-limit-guard", {
     description: "Show/reset pi-rate-limit-guard's tracked state, or reload its settings.json config",
