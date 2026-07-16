@@ -75,9 +75,20 @@
  *   PI_RATE_LIMIT_GUARD_CONTINUE_MESSAGE=continue
  *
  * Commands:
- *   /rate-limit-guard status   show current tracked state (both mechanisms)
- *   /rate-limit-guard reset    clear tracked state manually (also resets the auto-continue counter)
- *   /rate-limit-guard reload   re-read settings.json without restarting pi
+ *   /rate-limit-guard status                     show current tracked state (both mechanisms)
+ *   /rate-limit-guard set key=value [key=value...] [scope=project]   set one or more config fields directly (no LLM involved)
+ *   /rate-limit-guard reset                       clear tracked state manually (also resets the auto-continue counter)
+ *   /rate-limit-guard reload                      re-read settings.json without restarting pi
+ *
+ * `set` accepts the same keys as settings.json: stallTimeoutMs, warnAfter,
+ * abortAfterMs, fallbackModel (use fallbackModel=none or fallbackModel=""
+ * to clear), autoContinue (true/false), maxAutoContinues, continueMessage
+ * (quote values with spaces: continueMessage="please continue").
+ * Example: /rate-limit-guard set stallTimeoutMs=300000 maxAutoContinues=5
+ *
+ * The same configuration is also settable by an LLM/agent via the
+ * `rate_limit_guard_configure` tool (pi.registerTool) — `/rate-limit-guard
+ * set` is the equivalent for a human typing directly, no agent required.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -256,6 +267,66 @@ function writeRateLimitGuardSettings(path: string, updates: RateLimitGuardSettin
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writeFileSync(path, `${JSON.stringify(root, null, 2)}\n`, "utf-8");
+}
+
+const NUMBER_KEYS = new Set<keyof RateLimitGuardSettings>(["stallTimeoutMs", "warnAfter", "abortAfterMs", "maxAutoContinues"]);
+const BOOLEAN_KEYS = new Set<keyof RateLimitGuardSettings>(["autoContinue"]);
+
+/**
+ * Parses `/rate-limit-guard set key=value key2=value2 [scope=project]` style
+ * arguments into the same shape `rate_limit_guard_configure`'s `set` action
+ * accepts, so both the human-typed command and the LLM-callable tool apply
+ * updates through the exact same write path. Values with spaces need
+ * double-quotes: `continueMessage="please continue"`. Unknown keys or
+ * unparseable values are collected as errors rather than silently ignored
+ * or applied wrong.
+ */
+function parseSetArgs(rest: string): { updates: RateLimitGuardSettings; scope: "global" | "project"; errors: string[] } {
+  const updates: RateLimitGuardSettings = {};
+  let scope: "global" | "project" = "global";
+  const errors: string[] = [];
+
+  const tokenRe = /(\w+)=("([^"]*)"|\S*)/g;
+  let match: RegExpExecArray | null;
+  let sawAnyToken = false;
+
+  while ((match = tokenRe.exec(rest)) !== null) {
+    sawAnyToken = true;
+    const key = match[1];
+    const rawValue = match[3] !== undefined ? match[3] : match[2];
+
+    if (key === "scope") {
+      if (rawValue === "global" || rawValue === "project") scope = rawValue;
+      else errors.push(`invalid scope "${rawValue}" (expected "global" or "project")`);
+      continue;
+    }
+
+    if (NUMBER_KEYS.has(key as keyof RateLimitGuardSettings)) {
+      const n = Number(rawValue);
+      if (!Number.isFinite(n) || n < 0) {
+        errors.push(`invalid number for ${key}: "${rawValue}"`);
+        continue;
+      }
+      (updates as Record<string, unknown>)[key] = n;
+    } else if (BOOLEAN_KEYS.has(key as keyof RateLimitGuardSettings)) {
+      const v = rawValue.toLowerCase();
+      if (v === "true" || v === "1") (updates as Record<string, unknown>)[key] = true;
+      else if (v === "false" || v === "0") (updates as Record<string, unknown>)[key] = false;
+      else errors.push(`invalid boolean for ${key}: "${rawValue}" (expected true/false)`);
+    } else if (key === "fallbackModel") {
+      updates.fallbackModel = rawValue === "" || rawValue.toLowerCase() === "none" ? undefined : rawValue;
+    } else if (key === "continueMessage") {
+      updates.continueMessage = rawValue;
+    } else {
+      errors.push(`unknown key "${key}"`);
+    }
+  }
+
+  if (!sawAnyToken && rest.trim().length > 0) {
+    errors.push(`could not parse any key=value pairs from: "${rest.trim()}"`);
+  }
+
+  return { updates, scope, errors };
 }
 
 function fmtElapsed(ms: number): string {
@@ -549,6 +620,24 @@ export default function (pi: ExtensionAPI) {
   // Keep the process from staying alive just because of this timer.
   (watchdog as unknown as { unref?: () => void }).unref?.();
 
+  // Shared by both the `rate_limit_guard_configure` tool and the
+  // `/rate-limit-guard set` command — one write path, one place that
+  // resolves the target settings.json and refreshes the live `config`.
+  function applyRateLimitGuardUpdates(
+    ctx: ExtensionContext,
+    updates: RateLimitGuardSettings,
+    scope: "global" | "project",
+  ): ResolvedConfig {
+    const targetPath =
+      scope === "project" && ctx.cwd
+        ? join(ctx.cwd, CONFIG_DIR_NAME, "settings.json")
+        : join(getAgentDir(), "settings.json");
+
+    writeRateLimitGuardSettings(targetPath, updates);
+    config = resolveConfig(ctx.cwd);
+    return config;
+  }
+
   // LLM-callable tool — the /rate-limit-guard command above is human-typed
   // only; pi.registerTool() is what makes something callable by the agent
   // (via tool-calling) rather than requiring a human to type a slash command
@@ -606,30 +695,61 @@ export default function (pi: ExtensionAPI) {
       }
 
       const scope = params.scope ?? "global";
+      const newConfig = applyRateLimitGuardUpdates(ctx, updates, scope);
       const targetPath =
         scope === "project" && ctx.cwd
           ? join(ctx.cwd, CONFIG_DIR_NAME, "settings.json")
           : join(getAgentDir(), "settings.json");
 
-      writeRateLimitGuardSettings(targetPath, updates);
-      config = resolveConfig(ctx.cwd);
-
       return {
         content: [
           {
             type: "text",
-            text: `Updated ${targetPath} (rateLimitGuard). New effective config:\n${JSON.stringify(config, null, 2)}`,
+            text: `Updated ${targetPath} (rateLimitGuard). New effective config:\n${JSON.stringify(newConfig, null, 2)}`,
           },
         ],
-        details: config,
+        details: newConfig,
       };
     },
   });
 
   pi.registerCommand("rate-limit-guard", {
-    description: "Show/reset pi-rate-limit-guard's tracked state, or reload its settings.json config",
+    description: "Get/set pi-rate-limit-guard config, show/reset tracked state, or reload settings.json",
     handler: async (args, ctx) => {
-      const sub = (args || "").trim();
+      const trimmed = (args || "").trim();
+      const firstSpace = trimmed.indexOf(" ");
+      const sub = firstSpace === -1 ? trimmed : trimmed.slice(0, firstSpace);
+      const rest = firstSpace === -1 ? "" : trimmed.slice(firstSpace + 1).trim();
+
+      if (sub === "set") {
+        const { updates, scope, errors } = parseSetArgs(rest);
+
+        if (Object.keys(updates).length === 0) {
+          ctx.ui.notify(
+            "rate-limit-guard: nothing to set. Usage: " +
+              '/rate-limit-guard set stallTimeoutMs=300000 maxAutoContinues=5 [scope=project]' +
+              (errors.length > 0 ? ` (errors: ${errors.join("; ")})` : ""),
+            "error",
+          );
+          return;
+        }
+
+        try {
+          const newConfig = applyRateLimitGuardUpdates(ctx, updates, scope);
+          const targetLabel = scope === "project" ? ".pi/settings.json (project)" : "~/.pi/agent/settings.json (global)";
+          let msg =
+            `rate-limit-guard: updated ${targetLabel}. New effective config: ` +
+            `stallTimeoutMs=${newConfig.stallTimeoutMs}, warnAfter=${newConfig.warnAfter}, ` +
+            `abortAfterMs=${newConfig.abortAfterMs}, fallbackModel=${newConfig.fallbackModel ?? "(none)"}, ` +
+            `autoContinue=${newConfig.autoContinue}, maxAutoContinues=${newConfig.maxAutoContinues}, ` +
+            `continueMessage="${newConfig.continueMessage}"`;
+          if (errors.length > 0) msg += ` — ignored invalid: ${errors.join("; ")}`;
+          ctx.ui.notify(msg, errors.length > 0 ? "warning" : "info");
+        } catch (err) {
+          ctx.ui.notify(`rate-limit-guard: failed to update settings.json — ${(err as Error).message}`, "error");
+        }
+        return;
+      }
 
       if (sub === "reset") {
         resetStatusState(ctx);

@@ -162,17 +162,34 @@ leaving pi or hand-editing JSON:
   `action: "set"` with one or more fields writes to `settings.json` (global
   by default, or `scope: "project"` for `.pi/settings.json`) and applies
   immediately — no `/reload` needed. Pass `fallbackModel: ""` to clear it.
-  Refuses to touch a malformed/non-object settings.json rather than
-  clobbering it, and preserves every other key untouched (verified: a
-  `someOtherKey` sibling and pre-existing `rateLimitGuard` fields both
-  survive a partial `set` unchanged).
-- **`/rate-limit-guard status`** — human-typed slash command, read-only,
-  shown below.
+- **`/rate-limit-guard set key=value ...`** — the same thing, but typed
+  directly by a human, no agent involved:
+  ```
+  /rate-limit-guard set stallTimeoutMs=300000 maxAutoContinues=5
+  /rate-limit-guard set fallbackModel=anthropic/claude-sonnet-4-5 scope=project
+  /rate-limit-guard set fallbackModel=none
+  /rate-limit-guard set continueMessage="please continue"
+  ```
+  Accepts the same keys as `settings.json`/the tool. `fallbackModel=none` or
+  `fallbackModel=""` clears it; quote values containing spaces. Add
+  `scope=project` to write `.pi/settings.json` instead of the global one.
+  Unknown keys or invalid values are reported and skipped rather than
+  silently applied wrong — any other valid fields in the same command still
+  get applied.
+
+Both paths share one write function: preserves every other top-level key and
+every other `rateLimitGuard` field untouched, and refuses to touch a
+malformed/non-object `settings.json` rather than clobbering it (verified: a
+sibling key and pre-existing `rateLimitGuard` fields both survive a partial
+`set` unchanged; a deliberately corrupted `settings.json` is left
+byte-for-byte unmodified with a clear error instead).
 
 ## Commands
 
 - `/rate-limit-guard status` — show current config, tracked state for both
   mechanisms, and the auto-continue counter.
+- `/rate-limit-guard set key=value [key=value...] [scope=project]` — set one
+  or more config fields directly (see above).
 - `/rate-limit-guard reset` — manually clear tracked state, including the
   auto-continue counter.
 - `/rate-limit-guard reload` — re-read settings.json without restarting pi.
