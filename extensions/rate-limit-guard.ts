@@ -24,11 +24,21 @@
  * for the 429/529 case. The original status-code tracker is kept alongside
  * it for the cases that DO fail fast and visibly with 429/529.
  *
+ * v0.3: aborting alone still leaves you staring at an idle session with
+ * nothing happening until you type something. Both mechanisms now follow
+ * `ctx.abort()` with `pi.sendUserMessage("continue", { deliverAs: "followUp" })`
+ * so pi automatically resumes once the aborted run finishes unwinding —
+ * on the same model, or on the fallback model if one just got switched in.
+ * Bounded by `maxAutoContinues` so a persistently-stalling provider can't
+ * loop forever; the counter resets once a turn completes without us having
+ * had to intervene.
+ *
  * This extension does NOT change pi's core retry engine (that isn't exposed
  * to extensions). Both mechanisms here are observe-and-react, using only
  * documented extension hooks (`after_provider_response`, `before_provider_request`,
  * `turn_start`/`turn_end`, `message_start`/`message_update`,
- * `tool_execution_*`) plus `ctx.abort()` / `pi.setModel()` as the escape hatch.
+ * `tool_execution_*`) plus `ctx.abort()` / `pi.setModel()` / `pi.sendUserMessage()`
+ * as the escape hatch.
  *
  * Configuration — pi settings.json (preferred) or environment variables.
  *
@@ -41,7 +51,10 @@
  *       "stallTimeoutMs": 180000,     // [idle watchdog] ms of silence during an active turn before acting (default 180000 = 180s)
  *       "warnAfter": 2,               // [status tracker] consecutive 429/529s before showing a footer warning (default 2)
  *       "abortAfterMs": 120000,       // [status tracker] wall-clock ms stuck in a visible 429/529 streak before acting (default 120000 = 2min)
- *       "fallbackModel": "provider/model-id"  // if set, switch model instead of aborting once either ceiling is hit
+ *       "fallbackModel": "provider/model-id", // if set, switch model instead of just retrying on the same one
+ *       "autoContinue": true,         // send a "continue" message after aborting, so pi resumes automatically (default true)
+ *       "maxAutoContinues": 3,        // stop auto-continuing after this many consecutive aborts with no clean turn in between (default 3)
+ *       "continueMessage": "continue" // the message sent to resume (default "continue")
  *     }
  *   }
  *
@@ -57,10 +70,13 @@
  *   PI_RATE_LIMIT_GUARD_WARN_AFTER=2
  *   PI_RATE_LIMIT_GUARD_ABORT_AFTER_MS=120000
  *   PI_RATE_LIMIT_GUARD_FALLBACK_MODEL=provider/model-id
+ *   PI_RATE_LIMIT_GUARD_AUTO_CONTINUE=1|0
+ *   PI_RATE_LIMIT_GUARD_MAX_AUTO_CONTINUES=3
+ *   PI_RATE_LIMIT_GUARD_CONTINUE_MESSAGE=continue
  *
  * Commands:
  *   /rate-limit-guard status   show current tracked state (both mechanisms)
- *   /rate-limit-guard reset    clear tracked state manually
+ *   /rate-limit-guard reset    clear tracked state manually (also resets the auto-continue counter)
  *   /rate-limit-guard reload   re-read settings.json without restarting pi
  */
 
@@ -98,6 +114,9 @@ interface RateLimitGuardSettings {
   warnAfter?: number;
   abortAfterMs?: number;
   fallbackModel?: string;
+  autoContinue?: boolean;
+  maxAutoContinues?: number;
+  continueMessage?: string;
 }
 
 interface ResolvedConfig {
@@ -105,12 +124,18 @@ interface ResolvedConfig {
   abortAfterMs: number;
   stallTimeoutMs: number;
   fallbackModel: string | undefined;
+  autoContinue: boolean;
+  maxAutoContinues: number;
+  continueMessage: string;
 }
 
 const DEFAULTS = {
   warnAfter: 2,
   abortAfterMs: 120_000,
   stallTimeoutMs: 180_000,
+  autoContinue: true,
+  maxAutoContinues: 3,
+  continueMessage: "continue",
 };
 
 function envInt(name: string, fallback: number | undefined): number | undefined {
@@ -118,6 +143,15 @@ function envInt(name: string, fallback: number | undefined): number | undefined 
   if (!raw) return fallback;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function envBool(name: string, fallback: boolean | undefined): boolean | undefined {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const v = raw.trim().toLowerCase();
+  if (v === "1" || v === "true") return true;
+  if (v === "0" || v === "false") return false;
+  return fallback;
 }
 
 function readRateLimitGuardSettings(path: string): RateLimitGuardSettings | undefined {
@@ -164,8 +198,23 @@ function resolveConfig(cwd: string | undefined): ResolvedConfig {
     projectSettings?.fallbackModel ||
     globalSettings?.fallbackModel ||
     undefined;
+  const autoContinue =
+    envBool("PI_RATE_LIMIT_GUARD_AUTO_CONTINUE", undefined) ??
+    projectSettings?.autoContinue ??
+    globalSettings?.autoContinue ??
+    DEFAULTS.autoContinue;
+  const maxAutoContinues =
+    envInt("PI_RATE_LIMIT_GUARD_MAX_AUTO_CONTINUES", undefined) ??
+    projectSettings?.maxAutoContinues ??
+    globalSettings?.maxAutoContinues ??
+    DEFAULTS.maxAutoContinues;
+  const continueMessage =
+    process.env.PI_RATE_LIMIT_GUARD_CONTINUE_MESSAGE ||
+    projectSettings?.continueMessage ||
+    globalSettings?.continueMessage ||
+    DEFAULTS.continueMessage;
 
-  return { warnAfter, abortAfterMs, stallTimeoutMs, fallbackModel };
+  return { warnAfter, abortAfterMs, stallTimeoutMs, fallbackModel, autoContinue, maxAutoContinues, continueMessage };
 }
 
 function fmtElapsed(ms: number): string {
@@ -209,6 +258,13 @@ export default function (pi: ExtensionAPI) {
   // session/agent-level operations, not tied to the lifetime of one event.
   let lastCtx: ExtensionContext | undefined;
 
+  // Consecutive times we've had to abort+auto-continue without a clean turn
+  // landing in between. Reset whenever a turn completes on its own (see
+  // endTurn) so a genuinely transient stall doesn't count against a later,
+  // unrelated one — but persists across our own abort/continue cycle so a
+  // provider that's stuck in a loop can't make us retry forever.
+  let autoContinueCount = 0;
+
   function resetStatusState(ctx: ExtensionContext) {
     statusState = {
       consecutiveHits: 0,
@@ -235,7 +291,34 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function maybeAutoContinue(ctx: ExtensionContext) {
+    if (!config.autoContinue) return;
+
+    if (autoContinueCount >= config.maxAutoContinues) {
+      ctx.ui.notify(
+        `rate-limit-guard: reached the auto-continue cap (${config.maxAutoContinues}) without a clean turn landing in between — ` +
+          `not retrying automatically again. Run "/rate-limit-guard reset" once you believe the issue has cleared, then send a message.`,
+        "error",
+      );
+      return;
+    }
+
+    autoContinueCount += 1;
+    ctx.ui.notify(
+      `rate-limit-guard: sending "${config.continueMessage}" to resume (attempt ${autoContinueCount}/${config.maxAutoContinues}).`,
+      "info",
+    );
+    pi.sendUserMessage(config.continueMessage, { deliverAs: "followUp" });
+  }
+
+  // Always aborts the stuck/stalled run first — including when switching to
+  // a fallback model, so the old hung request doesn't keep sitting there in
+  // the background while a new turn starts on the new model — then, unless
+  // disabled or capped, sends a "continue" message so pi resumes on its own
+  // instead of leaving the session idle waiting for you to type something.
   function actOnFallbackOrAbort(ctx: ExtensionContext, reason: string) {
+    ctx.abort();
+
     const fallbackModel = config.fallbackModel;
     if (fallbackModel) {
       const [provider, ...rest] = fallbackModel.split("/");
@@ -251,6 +334,7 @@ export default function (pi: ExtensionAPI) {
           if (!ok) {
             ctx.ui.notify(`Could not switch to ${fallbackModel} (no API key for that model).`, "error");
           }
+          maybeAutoContinue(ctx);
         });
         return;
       }
@@ -259,8 +343,9 @@ export default function (pi: ExtensionAPI) {
         "error",
       );
     }
+
     ctx.ui.notify(reason, "error");
-    ctx.abort();
+    maybeAutoContinue(ctx);
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -360,17 +445,31 @@ export default function (pi: ExtensionAPI) {
     markActivity(ctx);
   });
 
+  // Deliberately keyed off `agent_end` only, NOT `turn_end` — both fire back
+  // to back at the boundary of a (possibly aborted) run, and calling this
+  // from both double-processes the same boundary: the first call correctly
+  // reads the acted flags and resets them, so a second call a millisecond
+  // later always sees "clean" and wipes the auto-continue counter even right
+  // after we just aborted, defeating maxAutoContinues entirely (reproduced
+  // empirically — see CHANGELOG/README). `agent_end` is also the more
+  // correct signal for a multi-turn tool-calling run: we only want this
+  // run-boundary bookkeeping once per run, not once per turn within it.
   function endTurn(ctx: ExtensionContext) {
+    // Captured before the reset below: if THIS run ended without either
+    // mechanism having had to intervene, it landed cleanly — the
+    // auto-continue budget can reset. If it ended immediately after our own
+    // abort, preserve the counter so a provider that's stuck in a loop is
+    // still bounded across the whole abort/continue cycle.
+    const endedCleanly = !stallState.acted && !statusState.acted;
+
     stallState.turnActive = false;
     stallState.warned = false;
     stallState.acted = false;
     ctx.ui.setStatus(STALL_STATUS_KEY, undefined);
     clearStatusStreak(ctx);
-  }
 
-  pi.on("turn_end", async (_event, ctx) => {
-    endTurn(ctx);
-  });
+    if (endedCleanly) autoContinueCount = 0;
+  }
 
   pi.on("agent_end", async (_event, ctx) => {
     endTurn(ctx);
@@ -418,7 +517,8 @@ export default function (pi: ExtensionAPI) {
         resetStatusState(ctx);
         stallState = { turnActive: stallState.turnActive, lastActivityAt: Date.now(), warned: false, acted: false };
         ctx.ui.setStatus(STALL_STATUS_KEY, undefined);
-        ctx.ui.notify("rate-limit-guard: state reset", "info");
+        autoContinueCount = 0;
+        ctx.ui.notify("rate-limit-guard: state reset (including auto-continue counter)", "info");
         return;
       }
 
@@ -427,7 +527,8 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(
           `rate-limit-guard: settings reloaded — stallTimeoutMs=${config.stallTimeoutMs}, ` +
             `warnAfter=${config.warnAfter}, abortAfterMs=${config.abortAfterMs}, ` +
-            `fallbackModel=${config.fallbackModel ?? "(none, aborts instead)"}`,
+            `fallbackModel=${config.fallbackModel ?? "(none)"}, autoContinue=${config.autoContinue}, ` +
+            `maxAutoContinues=${config.maxAutoContinues}, continueMessage="${config.continueMessage}"`,
           "info",
         );
         return;
@@ -436,8 +537,10 @@ export default function (pi: ExtensionAPI) {
       const lines: string[] = [];
       lines.push(
         `config: stallTimeoutMs=${config.stallTimeoutMs}, warnAfter=${config.warnAfter}, ` +
-          `abortAfterMs=${config.abortAfterMs}, fallbackModel=${config.fallbackModel ?? "(none, aborts instead)"}`,
+          `abortAfterMs=${config.abortAfterMs}, fallbackModel=${config.fallbackModel ?? "(none)"}, ` +
+          `autoContinue=${config.autoContinue}, maxAutoContinues=${config.maxAutoContinues}`,
       );
+      lines.push(`auto-continue count: ${autoContinueCount}/${config.maxAutoContinues}`);
       if (statusState.consecutiveHits > 0) {
         const elapsed = statusState.firstHitAt ? Date.now() - statusState.firstHitAt : 0;
         lines.push(

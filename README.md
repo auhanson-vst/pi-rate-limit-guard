@@ -55,7 +55,7 @@ and every streamed message via documented hooks, and react.
 3. Notifies once when that threshold is first crossed.
 4. Once a ceiling is hit — only when the provider gave no `retry-after` (if it
    did, pi's own bounded-wait logic already handles it) — aborts (default) or
-   switches to a fallback model.
+   switches to a fallback model, then auto-continues (see below).
 
 **Idle/stall watchdog:**
 1. Tracks wall-clock time since the last sign of forward progress during an
@@ -64,11 +64,26 @@ and every streamed message via documented hooks, and react.
 2. Shows an early footer warning at 50% of the stall threshold.
 3. Once the full threshold is hit with an active turn still silent, aborts
    (default) or switches to a fallback model — same escape hatch, triggered
-   by silence instead of an error code.
+   by silence instead of an error code — then auto-continues (see below).
 
 Both mechanisms clear themselves automatically once activity resumes or the
-turn ends, and compose without conflict — a visible retry storm keeps
+run ends cleanly, and compose without conflict — a visible retry storm keeps
 refreshing the idle timer, so it won't spuriously fire mid-retry.
+
+**Auto-continue after aborting.** Aborting alone still leaves you staring at
+an idle session with nothing happening until you type something. Both
+mechanisms follow `ctx.abort()` with `pi.sendUserMessage("continue", { deliverAs:
+"followUp" })`, so pi automatically resumes — on the same model, or on the
+fallback model if one just got switched in — instead of waiting for you.
+This is bounded by `maxAutoContinues`: if the same run keeps stalling with no
+clean turn landing in between, it stops auto-continuing after that many
+attempts and tells you instead of looping forever. The counter resets once a
+run completes without either mechanism having had to intervene.
+
+*(This bookkeeping is keyed off `agent_end`, not `turn_end` — both fire back
+to back at a run boundary, including an aborted one, and processing the same
+boundary twice reset the counter every cycle in an earlier version, silently
+defeating the cap. Fixed and reproduced/verified — see commit history.)*
 
 ## Install
 
@@ -95,7 +110,10 @@ edits take effect on `/reload` or a new session — no code changes needed:
     "stallTimeoutMs": 180000,
     "warnAfter": 2,
     "abortAfterMs": 120000,
-    "fallbackModel": "anthropic/claude-sonnet-4-5"
+    "fallbackModel": "anthropic/claude-sonnet-4-5",
+    "autoContinue": true,
+    "maxAutoContinues": 3,
+    "continueMessage": "continue"
   }
 }
 ```
@@ -105,7 +123,10 @@ edits take effect on `/reload` or a new session — no code changes needed:
 | `stallTimeoutMs` | `180000` (3 min) | idle watchdog | Ms of silence during an active turn before acting |
 | `warnAfter` | `2` | status tracker | Consecutive `429`/`529` responses before showing the footer warning |
 | `abortAfterMs` | `120000` (2 min) | status tracker | Wall-clock ms stuck in a visible `429`/`529` streak (with no `retry-after`) before acting |
-| `fallbackModel` | unset | both | `provider/model-id` (e.g. `anthropic/claude-sonnet-4-5`) — if set, switch to this model instead of aborting once either ceiling is hit |
+| `fallbackModel` | unset | both | `provider/model-id` (e.g. `anthropic/claude-sonnet-4-5`) — if set, switch to this model instead of just retrying on the same one |
+| `autoContinue` | `true` | both | Send a "continue" message after aborting, so pi resumes automatically |
+| `maxAutoContinues` | `3` | both | Stop auto-continuing after this many consecutive aborts with no clean run landing in between |
+| `continueMessage` | `"continue"` | both | The message sent to resume |
 
 pi has no first-class extension-settings API, so this reads settings.json
 directly off disk (via the same `getAgentDir()`/`CONFIG_DIR_NAME` pi exports
@@ -116,7 +137,8 @@ Environment variables override settings.json (useful for one-off/CI runs),
 same names, `PI_RATE_LIMIT_GUARD_` + the key in SCREAMING_SNAKE_CASE:
 `PI_RATE_LIMIT_GUARD_DISABLE=1`, `PI_RATE_LIMIT_GUARD_STALL_TIMEOUT_MS`,
 `PI_RATE_LIMIT_GUARD_WARN_AFTER`, `PI_RATE_LIMIT_GUARD_ABORT_AFTER_MS`,
-`PI_RATE_LIMIT_GUARD_FALLBACK_MODEL`.
+`PI_RATE_LIMIT_GUARD_FALLBACK_MODEL`, `PI_RATE_LIMIT_GUARD_AUTO_CONTINUE=1|0`,
+`PI_RATE_LIMIT_GUARD_MAX_AUTO_CONTINUES`, `PI_RATE_LIMIT_GUARD_CONTINUE_MESSAGE`.
 
 **Note on `fallbackModel`:** if the rate limit is an account-wide
 subscription usage cap (not a per-model limit), switching models may not
@@ -127,9 +149,10 @@ back control instead of a silent hang.
 
 ## Commands
 
-- `/rate-limit-guard status` — show current config and tracked state for
-  both mechanisms.
-- `/rate-limit-guard reset` — manually clear tracked state.
+- `/rate-limit-guard status` — show current config, tracked state for both
+  mechanisms, and the auto-continue counter.
+- `/rate-limit-guard reset` — manually clear tracked state, including the
+  auto-continue counter.
 - `/rate-limit-guard reload` — re-read settings.json without restarting pi.
 
 ## How it fits with pi's own retry settings
