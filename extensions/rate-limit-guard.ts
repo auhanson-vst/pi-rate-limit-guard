@@ -54,7 +54,8 @@
  *       "fallbackModel": "provider/model-id", // if set, switch model instead of just retrying on the same one
  *       "autoContinue": true,         // send a "continue" message after aborting, so pi resumes automatically (default true)
  *       "maxAutoContinues": 3,        // stop auto-continuing after this many consecutive aborts with no clean turn in between (default 3)
- *       "continueMessage": "continue" // the message sent to resume (default "continue")
+ *       "continueMessage": "continue", // the message sent to resume (default "continue")
+ *       "enabled": true               // runtime on/off toggle for both mechanisms (default true; see /rate-limit-guard off|on)
  *     }
  *   }
  *
@@ -65,7 +66,8 @@
  * new session, without needing to touch code.
  *
  * Environment variables override settings.json (useful for one-off/CI runs):
- *   PI_RATE_LIMIT_GUARD_DISABLE=1                 disable entirely
+ *   PI_RATE_LIMIT_GUARD_DISABLE=1                 disable entirely (load-time; see note above vs. off/on)
+ *   PI_RATE_LIMIT_GUARD_ENABLED=1|0                runtime enabled toggle, same as off/on/enabled setting
  *   PI_RATE_LIMIT_GUARD_STALL_TIMEOUT_MS=180000
  *   PI_RATE_LIMIT_GUARD_WARN_AFTER=2
  *   PI_RATE_LIMIT_GUARD_ABORT_AFTER_MS=120000
@@ -76,9 +78,21 @@
  *
  * Commands:
  *   /rate-limit-guard status                     show current tracked state (both mechanisms)
+ *   /rate-limit-guard off / on                    runtime toggle — disables/re-enables both detection mechanisms, persisted to settings.json
  *   /rate-limit-guard set key=value [key=value...] [scope=project]   set one or more config fields directly (no LLM involved)
  *   /rate-limit-guard reset                       clear tracked state manually (also resets the auto-continue counter)
  *   /rate-limit-guard reload                      re-read settings.json without restarting pi
+ *
+ * `off`/`on` are shorthand for `set enabled=false`/`set enabled=true` —
+ * same write path, so they persist across sessions like any other setting
+ * and are also settable via the rate_limit_guard_configure tool's `enabled`
+ * field. This is a RUNTIME toggle: the command/tool registrations always
+ * stay active so you can turn it back on. The separate
+ * PI_RATE_LIMIT_GUARD_DISABLE=1 env var below is a LOAD-TIME kill switch
+ * that skips registering anything at all (including this command) — use
+ * `off`/`on` for normal use; only use PI_RATE_LIMIT_GUARD_DISABLE for a hard
+ * disable (e.g. troubleshooting/CI) where you don't need it re-enabled
+ * without restarting.
  *
  * `set` accepts the same keys as settings.json: stallTimeoutMs, warnAfter,
  * abortAfterMs, fallbackModel (use fallbackModel=none or fallbackModel=""
@@ -130,6 +144,7 @@ interface RateLimitGuardSettings {
   autoContinue?: boolean;
   maxAutoContinues?: number;
   continueMessage?: string;
+  enabled?: boolean;
 }
 
 interface ResolvedConfig {
@@ -140,6 +155,7 @@ interface ResolvedConfig {
   autoContinue: boolean;
   maxAutoContinues: number;
   continueMessage: string;
+  enabled: boolean;
 }
 
 const DEFAULTS = {
@@ -149,6 +165,7 @@ const DEFAULTS = {
   autoContinue: true,
   maxAutoContinues: 3,
   continueMessage: "continue",
+  enabled: true,
 };
 
 function envInt(name: string, fallback: number | undefined): number | undefined {
@@ -226,8 +243,22 @@ function resolveConfig(cwd: string | undefined): ResolvedConfig {
     projectSettings?.continueMessage ||
     globalSettings?.continueMessage ||
     DEFAULTS.continueMessage;
+  const enabled =
+    envBool("PI_RATE_LIMIT_GUARD_ENABLED", undefined) ??
+    projectSettings?.enabled ??
+    globalSettings?.enabled ??
+    DEFAULTS.enabled;
 
-  return { warnAfter, abortAfterMs, stallTimeoutMs, fallbackModel, autoContinue, maxAutoContinues, continueMessage };
+  return {
+    warnAfter,
+    abortAfterMs,
+    stallTimeoutMs,
+    fallbackModel,
+    autoContinue,
+    maxAutoContinues,
+    continueMessage,
+    enabled,
+  };
 }
 
 /**
@@ -270,7 +301,7 @@ function writeRateLimitGuardSettings(path: string, updates: RateLimitGuardSettin
 }
 
 const NUMBER_KEYS = new Set<keyof RateLimitGuardSettings>(["stallTimeoutMs", "warnAfter", "abortAfterMs", "maxAutoContinues"]);
-const BOOLEAN_KEYS = new Set<keyof RateLimitGuardSettings>(["autoContinue"]);
+const BOOLEAN_KEYS = new Set<keyof RateLimitGuardSettings>(["autoContinue", "enabled"]);
 
 /**
  * Parses `/rate-limit-guard set key=value key2=value2 [scope=project]` style
@@ -393,6 +424,17 @@ export default function (pi: ExtensionAPI) {
     if (statusState.consecutiveHits > 0) resetStatusState(ctx);
   }
 
+  // Called whenever `enabled` flips (either direction). Without this, state
+  // accumulated while enabled but not acted on (e.g. stallState.turnActive
+  // left true, a stale lastActivityAt) could make the watchdog immediately
+  // fire a false stall right after being turned back on, based on time that
+  // elapsed while disabled rather than an actual stuck turn.
+  function resetTrackingState(ctx: ExtensionContext) {
+    resetStatusState(ctx);
+    stallState = { turnActive: false, lastActivityAt: undefined, warned: false, acted: false };
+    ctx.ui.setStatus(STALL_STATUS_KEY, undefined);
+  }
+
   function markActivity(ctx: ExtensionContext) {
     lastCtx = ctx;
     stallState.lastActivityAt = Date.now();
@@ -467,6 +509,7 @@ export default function (pi: ExtensionAPI) {
   // ── Mechanism 1: status-code tracker (429/529, fails fast + visibly) ──
 
   pi.on("after_provider_response", (event, ctx) => {
+    if (!config.enabled) return;
     markActivity(ctx);
 
     const status = event.status;
@@ -527,6 +570,7 @@ export default function (pi: ExtensionAPI) {
   // independent of whether the provider ever returned an error status.
 
   pi.on("turn_start", async (_event, ctx) => {
+    if (!config.enabled) return;
     stallState.turnActive = true;
     stallState.warned = false;
     stallState.acted = false;
@@ -534,26 +578,32 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_provider_request", (_event, ctx) => {
+    if (!config.enabled) return;
     markActivity(ctx);
   });
 
   pi.on("message_start", async (_event, ctx) => {
+    if (!config.enabled) return;
     markActivity(ctx);
   });
 
   pi.on("message_update", async (_event, ctx) => {
+    if (!config.enabled) return;
     markActivity(ctx);
   });
 
   pi.on("tool_execution_start", async (_event, ctx) => {
+    if (!config.enabled) return;
     markActivity(ctx);
   });
 
   pi.on("tool_execution_update", async (_event, ctx) => {
+    if (!config.enabled) return;
     markActivity(ctx);
   });
 
   pi.on("tool_execution_end", async (_event, ctx) => {
+    if (!config.enabled) return;
     markActivity(ctx);
   });
 
@@ -584,10 +634,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("agent_end", async (_event, ctx) => {
+    if (!config.enabled) return;
     endTurn(ctx);
   });
 
   const watchdog = setInterval(() => {
+    if (!config.enabled) return;
     if (!stallState.turnActive || !lastCtx || stallState.lastActivityAt === undefined) return;
     if (stallState.acted) return;
 
@@ -647,9 +699,10 @@ export default function (pi: ExtensionAPI) {
     label: "Rate Limit Guard Config",
     description:
       "Get or set pi-rate-limit-guard's configuration: stallTimeoutMs, warnAfter, abortAfterMs, fallbackModel, " +
-      "autoContinue, maxAutoContinues, continueMessage. `action: \"set\"` writes to settings.json under the " +
+      "autoContinue, maxAutoContinues, continueMessage, enabled. `action: \"set\"` writes to settings.json under the " +
       "rateLimitGuard key (global ~/.pi/agent/settings.json by default, or project .pi/settings.json with " +
-      'scope: "project") and applies immediately — no /reload needed. Pass fallbackModel: "" to clear it.',
+      'scope: "project") and applies immediately — no /reload needed. Pass fallbackModel: "" to clear it. ' +
+      'Set enabled: false to turn the whole extension off at runtime (same as /rate-limit-guard off), enabled: true to turn it back on.',
     promptSnippet: "rate_limit_guard_configure — get/set pi-rate-limit-guard settings (stall timeout, abort/retry behavior, auto-continue)",
     promptGuidelines: [
       'Use rate_limit_guard_configure with action: "get" to show the current rate-limit-guard config, or action: "set" with one or more fields to change it.',
@@ -668,6 +721,9 @@ export default function (pi: ExtensionAPI) {
         Type.Number({ description: "Stop auto-continuing after this many consecutive aborts with no clean run in between" }),
       ),
       continueMessage: Type.Optional(Type.String({ description: "The message sent to resume" })),
+      enabled: Type.Optional(
+        Type.Boolean({ description: "Runtime on/off toggle for both detection mechanisms (same as /rate-limit-guard off|on)" }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (params.action === "get") {
@@ -687,15 +743,17 @@ export default function (pi: ExtensionAPI) {
       if (params.autoContinue !== undefined) updates.autoContinue = params.autoContinue;
       if (params.maxAutoContinues !== undefined) updates.maxAutoContinues = params.maxAutoContinues;
       if (params.continueMessage !== undefined) updates.continueMessage = params.continueMessage;
+      if (params.enabled !== undefined) updates.enabled = params.enabled;
 
       if (Object.keys(updates).length === 0) {
         throw new Error(
-          "No fields provided to set. Pass at least one of stallTimeoutMs/warnAfter/abortAfterMs/fallbackModel/autoContinue/maxAutoContinues/continueMessage, or use action: \"get\".",
+          "No fields provided to set. Pass at least one of stallTimeoutMs/warnAfter/abortAfterMs/fallbackModel/autoContinue/maxAutoContinues/continueMessage/enabled, or use action: \"get\".",
         );
       }
 
       const scope = params.scope ?? "global";
       const newConfig = applyRateLimitGuardUpdates(ctx, updates, scope);
+      if ("enabled" in updates) resetTrackingState(ctx);
       const targetPath =
         scope === "project" && ctx.cwd
           ? join(ctx.cwd, CONFIG_DIR_NAME, "settings.json")
@@ -714,12 +772,31 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("rate-limit-guard", {
-    description: "Get/set pi-rate-limit-guard config, show/reset tracked state, or reload settings.json",
+    description: "Get/set pi-rate-limit-guard config, toggle it on/off, show/reset tracked state, or reload settings.json",
     handler: async (args, ctx) => {
       const trimmed = (args || "").trim();
       const firstSpace = trimmed.indexOf(" ");
       const sub = firstSpace === -1 ? trimmed : trimmed.slice(0, firstSpace);
       const rest = firstSpace === -1 ? "" : trimmed.slice(firstSpace + 1).trim();
+
+      if (sub === "off" || sub === "on") {
+        const { scope } = parseSetArgs(rest); // only "scope=project" is relevant here
+        const updates: RateLimitGuardSettings = { enabled: sub === "on" };
+        try {
+          const newConfig = applyRateLimitGuardUpdates(ctx, updates, scope);
+          resetTrackingState(ctx);
+          const targetLabel = scope === "project" ? ".pi/settings.json (project)" : "~/.pi/agent/settings.json (global)";
+          ctx.ui.notify(
+            `rate-limit-guard: ${newConfig.enabled ? "enabled" : "disabled"} (${targetLabel}). ` +
+              (newConfig.enabled ? "" : "Both detection mechanisms are now inactive — no stall/rate-limit detection, no auto-abort, no auto-continue. ") +
+              'Run "/rate-limit-guard on" to re-enable.',
+            "info",
+          );
+        } catch (err) {
+          ctx.ui.notify(`rate-limit-guard: failed to update settings.json — ${(err as Error).message}`, "error");
+        }
+        return;
+      }
 
       if (sub === "set") {
         const { updates, scope, errors } = parseSetArgs(rest);
@@ -763,7 +840,7 @@ export default function (pi: ExtensionAPI) {
       if (sub === "reload") {
         config = resolveConfig(ctx.cwd);
         ctx.ui.notify(
-          `rate-limit-guard: settings reloaded — stallTimeoutMs=${config.stallTimeoutMs}, ` +
+          `rate-limit-guard: settings reloaded — enabled=${config.enabled}, stallTimeoutMs=${config.stallTimeoutMs}, ` +
             `warnAfter=${config.warnAfter}, abortAfterMs=${config.abortAfterMs}, ` +
             `fallbackModel=${config.fallbackModel ?? "(none)"}, autoContinue=${config.autoContinue}, ` +
             `maxAutoContinues=${config.maxAutoContinues}, continueMessage="${config.continueMessage}"`,
@@ -774,7 +851,7 @@ export default function (pi: ExtensionAPI) {
 
       const lines: string[] = [];
       lines.push(
-        `config: stallTimeoutMs=${config.stallTimeoutMs}, warnAfter=${config.warnAfter}, ` +
+        `config: enabled=${config.enabled}, stallTimeoutMs=${config.stallTimeoutMs}, warnAfter=${config.warnAfter}, ` +
           `abortAfterMs=${config.abortAfterMs}, fallbackModel=${config.fallbackModel ?? "(none)"}, ` +
           `autoContinue=${config.autoContinue}, maxAutoContinues=${config.maxAutoContinues}`,
       );

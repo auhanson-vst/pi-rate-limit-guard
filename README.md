@@ -113,7 +113,8 @@ edits take effect on `/reload` or a new session — no code changes needed:
     "fallbackModel": "anthropic/claude-sonnet-4-5",
     "autoContinue": true,
     "maxAutoContinues": 3,
-    "continueMessage": "continue"
+    "continueMessage": "continue",
+    "enabled": true
   }
 }
 ```
@@ -127,6 +128,34 @@ edits take effect on `/reload` or a new session — no code changes needed:
 | `autoContinue` | `true` | both | Send a "continue" message after aborting, so pi resumes automatically |
 | `maxAutoContinues` | `3` | both | Stop auto-continuing after this many consecutive aborts with no clean run landing in between |
 | `continueMessage` | `"continue"` | both | The message sent to resume |
+| `enabled` | `true` | both | Runtime on/off toggle — see "Disabling it" below |
+
+### Disabling it
+
+**`/rate-limit-guard off`** and **`/rate-limit-guard on`** are a runtime
+toggle for both detection mechanisms — shorthand for `set enabled=false` /
+`set enabled=true`, so they persist to `settings.json` like any other
+setting (add `scope=project` to toggle per-project instead of globally).
+Also settable via `rate_limit_guard_configure`'s `enabled` field for an
+agent to toggle.
+
+This is deliberately different from `PI_RATE_LIMIT_GUARD_DISABLE=1`: that
+env var is checked once at extension **load time** and skips registering
+*anything at all*, including the `/rate-limit-guard` command itself — so
+there'd be no way to turn it back on without restarting pi. `off`/`on` keep
+the command and tool registered and just gate the detection logic
+(`after_provider_response`, the idle watchdog, turn/message/tool tracking),
+so you can always flip it back. Use `off`/`on` for normal use; reserve
+`PI_RATE_LIMIT_GUARD_DISABLE` for a hard kill (e.g. troubleshooting/CI)
+where you don't need it back without a restart.
+
+Toggling resets tracked state on both sides of the flip, so re-enabling
+mid-session starts clean rather than immediately misfiring on stale state
+accumulated while disabled. Verified live against the wedged-stream repro:
+with `enabled=false`, a stall that would normally trigger after
+`stallTimeoutMs` produced **zero** aborts/notifications over a window well
+past the threshold; `/rate-limit-guard on` afterward, on a fresh turn,
+restored the exact same abort + bounded auto-continue behavior as before.
 
 pi has no first-class extension-settings API, so this reads settings.json
 directly off disk (via the same `getAgentDir()`/`CONFIG_DIR_NAME` pi exports
@@ -186,8 +215,10 @@ byte-for-byte unmodified with a clear error instead).
 
 ## Commands
 
-- `/rate-limit-guard status` — show current config, tracked state for both
-  mechanisms, and the auto-continue counter.
+- `/rate-limit-guard status` — show current config (including `enabled`),
+  tracked state for both mechanisms, and the auto-continue counter.
+- `/rate-limit-guard off` / `/rate-limit-guard on` — runtime toggle for
+  both detection mechanisms (see "Disabling it" above).
 - `/rate-limit-guard set key=value [key=value...] [scope=project]` — set one
   or more config fields directly (see above).
 - `/rate-limit-guard reset` — manually clear tracked state, including the
